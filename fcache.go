@@ -230,11 +230,11 @@ func (c *Cache) Prune() error {
 
 // An Entry is a cache entry.
 type Entry struct {
-	Key       string    `json:"key",db:"key"`
-	CreatedAt time.Time `json:"created_at",db:"created_at_unix_ms"`
+	Key       string    `json:"key" db:"key"`
+	CreatedAt time.Time `json:"created_at" db:"created_at_unix_ms"`
 	// ExpiresAt is zero if the entry was created without a TTL.
-	ExpiresAt time.Time       `json:"expires_at",db:"expires_at_unix_ms"`
-	Data      json.RawMessage `json:"data",db:"data"`
+	ExpiresAt time.Time       `json:"expires_at" db:"expires_at_unix_ms"`
+	Data      json.RawMessage `json:"data" db:"data"`
 }
 
 // Expired returns if the Entry is expired.
