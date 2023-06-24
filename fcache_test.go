@@ -228,8 +228,13 @@ func TestInvalidType(t *testing.T) {
 	}
 	defer c.Close()
 
-	if err := c.Store("key", func() {}, -1); err != nil {
-		t.Fatalf("%v - %#v", err, err)
+	err = c.Store("key", func() {}, -1)
+	if err == nil {
+		t.Fatal("expected an error but got none")
+	}
+	var dst *json.UnsupportedTypeError
+	if !errors.As(err, &dst) {
+		t.Fatalf("invalid error type: %T", err)
 	}
 }
 
