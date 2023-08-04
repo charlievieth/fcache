@@ -92,7 +92,9 @@ CREATE TABLE IF NOT EXISTS cache (
 	key                TEXT PRIMARY KEY NOT NULL,
 	data               BLOB NOT NULL,
 	UNIQUE(key)        ON CONFLICT REPLACE
-) WITHOUT ROWID;`
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS cache_expires_at_unix_ms_idx ON cache(expires_at_unix_ms);`
 
 // New returns a new fcache with database path
 func New(database string, opts ...Option) (*Cache, error) {
@@ -311,6 +313,26 @@ func (c *Cache) CountContext(ctx context.Context) (int64, error) {
 // CountContext returns the number of entries in the cache.
 func (c *Cache) Count() (int64, error) {
 	return c.CountContext(context.Background())
+}
+
+// ExpiredCountContext return the number of expired entries in the cache.
+func (c *Cache) ExpiredCountContext(ctx context.Context) (int64, error) {
+	const query = `
+	SELECT COUNT(*) FROM
+		cache
+	WHERE
+		0 <= expires_at_unix_ms AND expires_at_unix_ms < ?;`
+	var n int64
+	ts := time.Now().UnixMilli()
+	err := c.retry(ctx, func() error {
+		return c.db.QueryRowContext(ctx, query, ts).Scan(&n)
+	})
+	return n, err
+}
+
+// ExpiredCountContext return the number of expired entries in the cache.
+func (c *Cache) ExpiredCount() (int64, error) {
+	return c.ExpiredCountContext(context.Background())
 }
 
 // func (c *Cache) ContainsContext(ctx context.Context, key string) (bool, error) {
