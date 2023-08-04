@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -35,10 +38,62 @@ func TestUserCacheDir(t *testing.T) {
 	})
 }
 
+// WARN: delete me
+func TestNew(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.Remove(tmp); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(filepath.Join(tmp, "does_not_exist.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.db.Ping(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNewUserCache(t *testing.T) {
+	tmp := t.TempDir()
+	// dir := filepath.Join(tmp)
+	t.Setenv("XDG_CACHE_HOME", tmp)
+	c, err := NewUserCache("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	must(t, c.Store("key", 1, -1))
+
+	dbfile := filepath.Join(tmp, "test", "cache.sqlite3")
+	if _, err := os.Stat(dbfile); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSpaceInDatabaseName(t *testing.T) {
+	tmp := t.TempDir()
+	t.Cleanup(func() {
+		os.RemoveAll(tmp)
+	})
+	c, err := New(filepath.Join(tmp, "my database name.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	must(t, c.Store("k", 1, -1))
+	var v int64
+	if _, err := c.Load("k", &v); err != nil {
+		t.Fatal(err)
+	}
+	if v != 1 {
+		t.Fatalf("got: %d; want: %d", v, 1)
+	}
+}
+
 func must(t testing.TB, err error) {
 	t.Helper()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%[1]s - %#[1]v", err)
 	}
 }
 
@@ -59,7 +114,7 @@ func TestCache(t *testing.T) {
 		var i int64
 		ok, err := c.Load("key", &i)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("%[1]s - %#[1]v", err)
 		}
 		if !ok {
 			t.Errorf("failed to find key: %q", "key")
@@ -69,6 +124,35 @@ func TestCache(t *testing.T) {
 			t.Errorf("got: %d want: %d", i, 1)
 		}
 	}
+}
+
+func TestCount(t *testing.T) {
+	c, err := New(tempFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	assertCount := func(want int64) {
+		n, err := c.Count()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Errorf("Count() = %d; want: %d", n, want)
+		}
+	}
+
+	for i := 0; i < 8; i++ {
+		must(t, c.Store("key_"+strconv.Itoa(i), i, 1))
+	}
+	assertCount(8)
+
+	time.Sleep(time.Millisecond * 5)
+	if err := c.Prune(); err != nil {
+		t.Fatal(err)
+	}
+	assertCount(0)
 }
 
 func TestEmptyKey(t *testing.T) {
@@ -139,6 +223,185 @@ func TestTTL(t *testing.T) {
 	}
 }
 
+func TestInvalidType(t *testing.T) {
+	c, err := New(tempFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	err = c.Store("key", func() {}, -1)
+	if err == nil {
+		t.Fatal("expected an error but got none")
+	}
+	var dst *json.UnsupportedTypeError
+	if !errors.As(err, &dst) {
+		t.Fatalf("invalid error type: %T", err)
+	}
+}
+
+func TestNullValues(t *testing.T) {
+	c, err := New(tempFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	t.Run("Store", func(t *testing.T) {
+		if err := c.Store("key2", nil, -1); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("Load", func(t *testing.T) {
+		// TODO: return a useful error here
+		_, err := c.Load("key2", nil)
+		if err == nil {
+			t.Fatal(err)
+		}
+		var target *json.InvalidUnmarshalError
+		if !errors.As(err, &target) {
+			t.Fatalf("expected error (%#[1]v) to unwrap to: %[2]T: %#[2]v", err, target)
+		}
+	})
+}
+
+func TestContextCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	c, err := New(tempFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := c.StoreContext(ctx, "key", 1, -1); !errors.Is(err, context.Canceled) {
+		t.Errorf("want: %v; got: %v", context.Canceled, err)
+	}
+	var v int64
+	if _, err := c.LoadContext(ctx, "key", &v); !errors.Is(err, context.Canceled) {
+		t.Errorf("want: %v; got: %v", context.Canceled, err)
+	}
+	if err := c.PruneContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("want: %v; got: %v", context.Canceled, err)
+	}
+}
+
+func TestClosed(t *testing.T) {
+	c, err := New(tempFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := c.Store("key", 1, -1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var v int64
+	if _, err := c.Load("key", &v); err == nil {
+		t.Fatal("expected error after closing the cache")
+	}
+}
+
+func TestParallelWrites(t *testing.T) {
+	keys := new([1024]string)
+	for i := range keys {
+		keys[i] = "key_" + strconv.Itoa(i)
+	}
+
+	tmp := tempFile(t)
+	n := new(atomic.Int64)
+	wg := new(sync.WaitGroup)
+	start := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Cancel context on error
+	errorf := func(format string, args ...any) {
+		t.Helper()
+		t.Errorf(format, args...)
+		cancel()
+	}
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			// TODO(charlie): we may need a much longer busy timeout when testing in CI
+			c, err := New(tmp, BusyTimeout(time.Second))
+			if err != nil {
+				errorf("%v", err)
+				return
+			}
+			defer c.Close()
+			<-start
+			for v := n.Add(1); v < 100_000; v = n.Add(1) {
+				switch {
+				case v%512 == 0:
+					if err := c.PruneContext(ctx); err != nil {
+						errorf("%d.%d: %v - %#v", id, v, err, err)
+						return
+					}
+				case v&1 != 0:
+					key := keys[v%int64(len(keys))]
+					if err := c.StoreContext(ctx, key, v, time.Millisecond*5); err != nil {
+						errorf("%d.%d: %v - %#v", id, v, err, err)
+						return
+					}
+				default:
+					key := keys[v%int64(len(keys))]
+					var dst int64
+					if _, err := c.LoadContext(ctx, key, &dst); err != nil {
+						errorf("%d.%d: %v - %#v", id, v, err, err)
+						return
+					}
+				}
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+}
+
+func TestPrune(t *testing.T) {
+	t.Parallel() // Parallel because we sleep
+	c, err := New(tempFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := c.Store("key1", 1, -1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Store("key2", 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Store("key3", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prune(); err != nil {
+		t.Fatal(err)
+	}
+	var i int
+	if ok, err := c.Load("key1", &i); err != nil || !ok {
+		t.Errorf("Get(%q) = %t, %v; want: %t, %v", "key1", ok, err, true, nil)
+	}
+	// Sleep until entry is expired
+	time.Sleep(time.Millisecond * 20)
+	if ok, err := c.Load("key2", &i); err != nil || ok {
+		t.Errorf("Get(%q) = %t, %v; want: %t, %v", "key2", ok, err, false, nil)
+	}
+	if ok, err := c.Load("key3", &i); err != nil || !ok {
+		t.Errorf("Get(%q) = %t, %v; want: %t, %v", "key3", ok, err, true, nil)
+	}
+}
+
 func TestEntries(t *testing.T) {
 	toJSON := func(v any) []byte {
 		data, err := json.Marshal(v)
@@ -191,19 +454,17 @@ func TestEntries(t *testing.T) {
 		t.Fatalf("Got %d entries; want: %d", len(ents), len(want))
 	}
 
-	tdelta := func(t1, t2 time.Time) time.Duration {
-		d := t1.Sub(t2)
-		if d < 0 {
-			d *= -1
+	entriesEqual := func(i int, e1, e2 *Entry) {
+		tdelta := func(t1, t2 time.Time) time.Duration {
+			d := t1.Sub(t2)
+			if d < 0 {
+				d *= -1
+			}
+			return d
 		}
-		return d
-	}
-	tequal := func(t1, t2 time.Time, delta time.Duration) bool {
-		return t1.Round(delta).Equal(t2.Round(delta))
-	}
-
-	for i, e1 := range want {
-		e2 := ents[i]
+		tequal := func(t1, t2 time.Time, delta time.Duration) bool {
+			return tdelta(t1, t2) <= delta
+		}
 		if e2.Key != e1.Key {
 			t.Errorf("%d: Key: got %q; want: %q", i, e2.Key, e1.Key)
 		}
@@ -219,131 +480,76 @@ func TestEntries(t *testing.T) {
 				i, e2.CreatedAt, e1.CreatedAt, tdelta(e2.CreatedAt, e1.CreatedAt))
 		}
 	}
-}
 
-func TestInvalidType(t *testing.T) {
-	c, err := New(tempFile(t))
-	if err != nil {
-		t.Fatal(err)
+	for i := range want {
+		entriesEqual(i, &want[i], &ents[i])
 	}
-	defer c.Close()
 
-	err = c.Store("key", func() {}, -1)
-	if err == nil {
-		t.Fatal("expected an error but got none")
-	}
-	var dst *json.UnsupportedTypeError
-	if !errors.As(err, &dst) {
-		t.Fatalf("invalid error type: %T", err)
+	for i := range want {
+		got, err := c.Entry(want[i].Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entriesEqual(i, &want[i], got)
 	}
 }
 
-func TestContextCancelled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	c, err := New(tempFile(t))
-	if err != nil {
-		t.Fatal(err)
+func TestEntryExpired(t *testing.T) {
+	now := time.Now()
+	e := Entry{CreatedAt: now, ExpiresAt: time.Time{}}
+	if e.Expired() {
+		t.Errorf("%+v.Expired() = %t; want: %t", e, e.Expired(), false)
 	}
-	defer c.Close()
-
-	if err := c.StoreContext(ctx, "key", 1, -1); !errors.Is(err, context.Canceled) {
-		t.Errorf("want: %v; got: %v", context.Canceled, err)
+	e.ExpiresAt = now.Add(time.Second)
+	if e.Expired() {
+		t.Errorf("%+v.Expired() = %t; want: %t", e, e.Expired(), false)
 	}
-	var v int64
-	if _, err := c.LoadContext(ctx, "key", &v); !errors.Is(err, context.Canceled) {
-		t.Errorf("want: %v; got: %v", context.Canceled, err)
-	}
-	if err := c.PruneContext(ctx); !errors.Is(err, context.Canceled) {
-		t.Errorf("want: %v; got: %v", context.Canceled, err)
+	e.ExpiresAt = now.Add(-time.Second)
+	if !e.Expired() {
+		t.Errorf("%+v.Expired() = %t; want: %t", e, e.Expired(), true)
 	}
 }
 
-func TestClosed(t *testing.T) {
-	c, err := New(tempFile(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	if err := c.Store("key", 1, -1); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
-	}
-	var v int64
-	if _, err := c.Load("key", &v); err == nil {
-		t.Fatal("expected error after closing the cache")
+func TestEntryTTL(t *testing.T) {
+	now := time.Now()
+	e := Entry{CreatedAt: now, ExpiresAt: now.Add(time.Second)}
+	if e.TTL() != time.Second {
+		t.Errorf("TTL = %s; want: %s", e.TTL(), time.Second)
 	}
 }
 
-// func TestParallelWrites(t *testing.T) {
-// 	// var n int64
-// 	tmp := t.TempDir()
-// 	n := new(atomic.Int64)
-// 	wg := new(sync.WaitGroup)
-// 	start := make(chan struct{})
-// 	for i := 0; i < 4; i++ {
-// 		wg.Add(1)
-// 		go func() {
-// 			<-start
-// 			defer wg.Done()
-// 			c, err := New(tmp)
-// 			if err != nil {
-// 				t.Error(err)
-// 				return
-// 			}
-// 			defer c.Close()
-// 			v := n.Add(1)
-// 			// if err :=  {
-//
-// 			// }
-// 			if v >= 100_000 {
-// 				break
-// 			}
-// 		}()
-// 	}
-// }
+func TestEntryUnmarshal(t *testing.T) {
+	e := Entry{Data: json.RawMessage(`"abc"`)}
+	var s string
+	if err := e.Unmarshal(&s); err != nil {
+		t.Fatal(err)
+	}
+	if s != "abc" {
+		t.Errorf("got: %q; want: %q", s, "abc")
+	}
+}
 
-func TestPrune(t *testing.T) {
-	t.Parallel() // Parallel because we sleep
-	c, err := New(tempFile(t))
+var memory = flag.Bool("memory", false, "Use in memory database for benchmarks")
+
+func benchDatabase(t testing.TB) string {
+	if *memory {
+		return ":memory:"
+	}
+	return filepath.Join(t.TempDir(), "test.sqlite3")
+}
+
+func benchCache(t testing.TB, opts ...Option) *Cache {
+	c, err := New(benchDatabase(t), opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
-
-	if err := c.Store("key1", 1, -1); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Store("key2", 1, 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Store("key3", 1, time.Minute); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Prune(); err != nil {
-		t.Fatal(err)
-	}
-	var i int
-	if ok, err := c.Load("key1", &i); err != nil || !ok {
-		t.Errorf("Get(%q) = %t, %v; want: %t, %v", "key1", ok, err, true, nil)
-	}
-	// Sleep until entry is expired
-	time.Sleep(time.Millisecond * 20)
-	if ok, err := c.Load("key2", &i); err != nil || ok {
-		t.Errorf("Get(%q) = %t, %v; want: %t, %v", "key2", ok, err, false, nil)
-	}
-	if ok, err := c.Load("key3", &i); err != nil || !ok {
-		t.Errorf("Get(%q) = %t, %v; want: %t, %v", "key3", ok, err, true, nil)
-	}
+	t.Cleanup(func() { c.Close() })
+	return c
 }
 
 // TODO: include lazyInit() time?
 func BenchmarkCacheNew(b *testing.B) {
-	tmp := tempFile(b)
+	tmp := benchDatabase(b)
 	ctx := context.Background()
 	for i := 0; i < b.N; i++ {
 		c, err := New(tmp)
@@ -358,11 +564,7 @@ func BenchmarkCacheNew(b *testing.B) {
 }
 
 func BenchmarkCacheLoad(b *testing.B) {
-	c, err := New(tempFile(b))
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer c.Close()
+	c := benchCache(b)
 
 	if err := c.Store("key", 1, -1); err != nil {
 		b.Fatal(err)
@@ -376,11 +578,7 @@ func BenchmarkCacheLoad(b *testing.B) {
 }
 
 func BenchmarkCacheLoad1000(b *testing.B) {
-	c, err := New(tempFile(b))
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer c.Close()
+	c := benchCache(b)
 
 	rr := rand.New(rand.NewSource(12345))
 
@@ -419,6 +617,9 @@ func BenchmarkCacheLoad1000(b *testing.B) {
 // workflow for CLI tools that need to cache short-lived results
 // for things like auto-completion.
 func BenchmarkCacheNewLoad(b *testing.B) {
+	if *memory {
+		b.Skip("skipping: benchmark cannot run with the 'memory' option")
+	}
 	tmp := tempFile(b)
 	c, err := New(tmp)
 	if err != nil {
@@ -447,11 +648,7 @@ func BenchmarkCacheNewLoad(b *testing.B) {
 }
 
 func BenchmarkCacheStore(b *testing.B) {
-	c, err := New(tempFile(b))
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer c.Close()
+	c := benchCache(b)
 
 	ctx := context.Background()
 	if err := c.lazyInit(ctx); err != nil {
@@ -493,11 +690,7 @@ func BenchmarkCacheStore(b *testing.B) {
 }
 
 func BenchmarkCacheEntries(b *testing.B) {
-	c, err := New(tempFile(b))
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer c.Close()
+	c := benchCache(b)
 
 	var keys = [8]string{
 		"key_1",
@@ -540,11 +733,7 @@ func createExpiresAtUnixIndex(t testing.TB, c *Cache) {
 }
 
 func BenchmarkCachePrune(b *testing.B) {
-	c, err := New(tempFile(b))
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer c.Close()
+	c := benchCache(b)
 
 	const N = 1024
 	for i := 0; i < N; i++ {
@@ -558,3 +747,17 @@ func BenchmarkCachePrune(b *testing.B) {
 		}
 	}
 }
+
+// func BenchmarkLazyInit(b *testing.B) {
+// 	c, err := New(tempFile(b))
+// 	if err != nil {
+// 		b.Fatal(err)
+// 	}
+// 	defer c.Close()
+// 	ctx := context.Background()
+// 	for i := 0; i < b.N; i++ {
+// 		if err := c.lazyInit(ctx); err != nil {
+// 			b.Fatal(err)
+// 		}
+// 	}
+// }
