@@ -153,20 +153,13 @@ func (c *Cache) Close() error { return c.db.Close() }
 
 // isBusyErr returns true is the error is a sqlite3 bust timeout error.
 func isBusyErr(err error) bool {
-	if e, ok := err.(sqlite3.Error); ok {
-		return e.Code == sqlite3.ErrBusy
-	}
-	// Attempt to unwrap the error, this can occur if the callback
-	// to retry wraps the returned db error.
-	for {
-		err = errors.Unwrap(err)
-		if err == nil {
-			return false
-		}
+	for err != nil {
 		if e, ok := err.(sqlite3.Error); ok {
 			return e.Code == sqlite3.ErrBusy
 		}
+		err = errors.Unwrap(err)
 	}
+	return false
 }
 
 func stopTicker(t *time.Ticker) {
