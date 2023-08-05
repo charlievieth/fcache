@@ -5,14 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 func TestUserCacheDir(t *testing.T) {
@@ -36,22 +41,6 @@ func TestUserCacheDir(t *testing.T) {
 			t.Errorf("userCacheDir() = %s, %v; want: %s, %v", d1, e1, d2, e2)
 		}
 	})
-}
-
-// WARN: delete me
-func TestNew(t *testing.T) {
-	tmp := t.TempDir()
-	if err := os.Remove(tmp); err != nil {
-		t.Fatal(err)
-	}
-	c, err := New(filepath.Join(tmp, "does_not_exist.sqlite3"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	if err := c.db.Ping(); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestNewUserCache(t *testing.T) {
@@ -126,6 +115,18 @@ func TestCache(t *testing.T) {
 	}
 }
 
+// Wait for the clock to advance one millisecond
+func waitMilli(t testing.TB) {
+	ts := time.Now().UnixMilli()
+	for i := 0; i < 50; i++ {
+		if time.Now().UnixMilli() != ts {
+			return
+		}
+		time.Sleep(time.Millisecond / 2)
+	}
+	t.Fatal("failed to wait for clock to advance by one millisecond")
+}
+
 func TestCount(t *testing.T) {
 	c, err := New(tempFile(t))
 	if err != nil {
@@ -148,7 +149,7 @@ func TestCount(t *testing.T) {
 	}
 	assertCount(8)
 
-	time.Sleep(time.Millisecond * 5)
+	waitMilli(t)
 	if err := c.Prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -194,6 +195,143 @@ func TestKeyNotFound(t *testing.T) {
 	}
 }
 
+func TestExpiredCount(t *testing.T) {
+	c, err := New(tempFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	keys := []string{"key1", "key2"}
+	for _, k := range keys {
+		must(t, c.Store(k, k, -1))
+	}
+	if n, err := c.ExpiredCount(); err != nil || n != 0 {
+		t.Errorf("ExpiredCount() = %d, %v; want: %d, %v", n, err, 0, nil)
+	}
+
+	for _, k := range keys {
+		must(t, c.Store(k, k, 0))
+	}
+	waitMilli(t)
+	if n, err := c.ExpiredCount(); err != nil || n != 2 {
+		t.Errorf("ExpiredCount() = %d, %v; want: %d, %v", n, err, 2, nil)
+	}
+}
+
+func TestContains(t *testing.T) {
+	c, err := New(tempFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	keys := []string{"key1", "key2"}
+	for _, k := range keys {
+		must(t, c.Store(k, k, -1))
+		if ok, err := c.Contains(k); !ok || err != nil {
+			t.Errorf("Contains(%q) = %t, %v; want: %t, %v", k, ok, err, true, nil)
+		}
+	}
+
+	// Test with expired entries
+	for _, k := range keys {
+		must(t, c.Store(k, k, 0))
+	}
+	waitMilli(t)
+	for _, k := range keys {
+		must(t, c.Store(k, k, -1))
+		if ok, err := c.Contains(k); !ok || err != nil {
+			t.Errorf("Contains(%q) = %t, %v; want: %t, %v", k, ok, err, true, nil)
+		}
+	}
+
+	// Non-existent entry
+	if ok, err := c.Contains("not_found"); ok || err != nil {
+		t.Errorf("Contains(%q) = %t, %v; want: %t, %v", "not_found", ok, err, false, nil)
+	}
+}
+
+func TestKeys(t *testing.T) {
+	c, err := New(tempFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	keys := make([]string, 64)
+	for i := range keys {
+		keys[i] = "key_" + strconv.Itoa(i)
+	}
+	rand.Shuffle(len(keys), func(i, j int) {
+		keys[i], keys[j] = keys[j], keys[i]
+	})
+
+	for i, k := range keys {
+		must(t, c.Store(k, i, -1))
+	}
+
+	got, err := c.Keys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sort.StringsAreSorted(got) {
+		t.Error("keys are not sorted")
+	}
+	if len(got) != len(keys) {
+		t.Fatalf("len(got) = %d; want: %d", len(got), len(keys))
+	}
+	sort.Strings(keys)
+	for i := range got {
+		if got[i] != keys[i] {
+			t.Errorf("got[%d] = %q; want: %q", i, got[i], keys[i])
+		}
+	}
+}
+
+func TestDelete(t *testing.T) {
+	c, err := New(tempFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	keys := []string{"key1", "key2"}
+	for _, k := range keys {
+		must(t, c.Store(k, k, -1))
+	}
+
+	// Found
+	if ok, err := c.Delete("key1"); !ok || err != nil {
+		t.Errorf("Delete(%q) = %t, %v; want: %t, %v", "key1", ok, err, true, nil)
+	}
+	if ok, err := c.Contains("key1"); ok || err != nil {
+		t.Errorf("Contains(%q) = %t, %v; want: %t, %v", "key1", ok, err, false, nil)
+	}
+
+	// Not found
+	if ok, err := c.Delete("not_found"); ok || err != nil {
+		t.Errorf("Delete(%q) = %t, %v; want: %t, %v", "not_found", ok, err, false, nil)
+	}
+}
+
+func TestDisallowUnknownFields(t *testing.T) {
+	c, err := New(tempFile(t), DisallowUnknownFields())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	must(t, c.Store("key", map[string]int{"A": 1, "B": 2, "C": 3, "D": 4}, -1))
+
+	var dst struct {
+		A, B, C int
+	}
+	if _, err := c.Load("key", &dst); err == nil {
+		t.Error("Expected a \"json: unknown field\" error")
+	}
+}
+
 func TestTTL(t *testing.T) {
 	t.Parallel() // Parallel because we sleep
 	c, err := New(tempFile(t))
@@ -215,8 +353,7 @@ func TestTTL(t *testing.T) {
 		t.Errorf("Get(%q) = %t, %v; want: %t, %v", "key3", ok, err, true, nil)
 	}
 
-	// Sleep until entry is expired
-	time.Sleep(time.Millisecond * 20)
+	waitMilli(t) // sleep until entry is expired
 	ok, err := c.Load("key2", &i)
 	if err != nil || ok {
 		t.Errorf("Get(%q) = %t, %v; want: %t, %v", "key2", ok, err, false, nil)
@@ -308,6 +445,9 @@ func TestClosed(t *testing.T) {
 }
 
 func TestParallelWrites(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping: short test")
+	}
 	keys := new([1024]string)
 	for i := range keys {
 		keys[i] = "key_" + strconv.Itoa(i)
@@ -328,7 +468,11 @@ func TestParallelWrites(t *testing.T) {
 		cancel()
 	}
 
-	for i := 0; i < 4; i++ {
+	numCPU := 4
+	if runtime.NumCPU() == 1 {
+		numCPU = 2
+	}
+	for i := 0; i < numCPU; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -392,8 +536,8 @@ func TestPrune(t *testing.T) {
 	if ok, err := c.Load("key1", &i); err != nil || !ok {
 		t.Errorf("Get(%q) = %t, %v; want: %t, %v", "key1", ok, err, true, nil)
 	}
-	// Sleep until entry is expired
-	time.Sleep(time.Millisecond * 20)
+
+	waitMilli(t) // sleep until entry is expired
 	if ok, err := c.Load("key2", &i); err != nil || ok {
 		t.Errorf("Get(%q) = %t, %v; want: %t, %v", "key2", ok, err, false, nil)
 	}
@@ -526,6 +670,19 @@ func TestEntryUnmarshal(t *testing.T) {
 	}
 	if s != "abc" {
 		t.Errorf("got: %q; want: %q", s, "abc")
+	}
+}
+
+func TestIsBusyError(t *testing.T) {
+	var err error = sqlite3.Error{Code: sqlite3.ErrBusy}
+	if ok := isBusyErr(err); !ok {
+		t.Errorf("isBusyErr(%#v) = %t; want: %t", err, ok, true)
+	}
+	for i := 0; i < 3; i++ {
+		err = fmt.Errorf("wrapped %d: %w", i, err)
+		if ok := isBusyErr(err); !ok {
+			t.Errorf("isBusyErr(%#v) = %t; want: %t", err, ok, true)
+		}
 	}
 }
 
@@ -716,28 +873,12 @@ func BenchmarkCacheEntries(b *testing.B) {
 	}
 }
 
-// TODO: test Prune with an expires_at index.
-func createExpiresAtUnixIndex(t testing.TB, c *Cache) {
-	ctx := context.Background()
-	if err := c.lazyInit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	const indexStmt = `
-	CREATE INDEX
-		expires_at_unix_ms_idx
-	ON
-		cache(expires_at_unix_ms);`
-	if _, err := c.db.ExecContext(ctx, indexStmt); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func BenchmarkCachePrune(b *testing.B) {
 	c := benchCache(b)
 
 	const N = 1024
 	for i := 0; i < N; i++ {
-		must(b, c.Store("key_"+strconv.Itoa(i), int64(i), time.Millisecond*time.Duration(i+1)))
+		must(b, c.Store("key_"+strconv.Itoa(i), int64(i), time.Hour))
 	}
 	b.ResetTimer()
 
@@ -748,16 +889,21 @@ func BenchmarkCachePrune(b *testing.B) {
 	}
 }
 
-// func BenchmarkLazyInit(b *testing.B) {
-// 	c, err := New(tempFile(b))
-// 	if err != nil {
-// 		b.Fatal(err)
-// 	}
-// 	defer c.Close()
-// 	ctx := context.Background()
-// 	for i := 0; i < b.N; i++ {
-// 		if err := c.lazyInit(ctx); err != nil {
-// 			b.Fatal(err)
-// 		}
-// 	}
-// }
+func BenchmarkIsBusyErr(b *testing.B) {
+	b.Run("BusyError", func(b *testing.B) {
+		var err error = sqlite3.Error{Code: sqlite3.ErrBusy}
+		for i := 0; i < b.N; i++ {
+			if !isBusyErr(err) {
+				b.Fatal("bad result")
+			}
+		}
+	})
+	b.Run("OtherError", func(b *testing.B) {
+		err := errors.New("error")
+		for i := 0; i < b.N; i++ {
+			if isBusyErr(err) {
+				b.Fatal("bad result")
+			}
+		}
+	})
+}

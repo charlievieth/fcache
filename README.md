@@ -4,5 +4,5 @@
 
 # fcache
 
-fcache is a simple and fast SQLite based filesystem cache that is designed
-for CLIs and other tools that need to temporarily cache and retrieve data.
+fcache is a simple and fast SQLite based cache that is designed for CLIs and
+other tools that need to temporarily cache and retrieve data.
