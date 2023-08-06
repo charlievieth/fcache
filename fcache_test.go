@@ -332,6 +332,66 @@ func TestDisallowUnknownFields(t *testing.T) {
 	}
 }
 
+func TestReadOnly(t *testing.T) {
+	tmp := tempFile(t)
+	c, err := New(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	keys := []string{"key1", "key2"}
+	for _, k := range keys {
+		must(t, c.Store(k, k, -1))
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	openReadOnly := func(t *testing.T) *Cache {
+		c, err := New(tmp, ReadOnly())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+
+	t.Run("Read", func(t *testing.T) {
+		c := openReadOnly(t)
+		for _, k := range keys {
+			var dst string
+			if ok, err := c.Load(k, &dst); !ok || err != nil {
+				t.Errorf("Load(%q, %T) = %t, %v; want: %t, %v", k, dst, ok, err, true, nil)
+			}
+		}
+	})
+
+	t.Run("Write", func(t *testing.T) {
+		err := openReadOnly(t).Store("new_key", "1", -1)
+		var target sqlite3.Error
+		if !errors.As(err, &target) {
+			t.Fatalf("Expected error type: %T; got: %T", target, err)
+		}
+		if target.Code != sqlite3.ErrReadonly {
+			t.Fatalf("Expected error code: %v; got: %v", sqlite3.ErrReadonly, target.Code)
+		}
+	})
+
+	t.Run("Open", func(t *testing.T) {
+		c, err := New(tempFile(t), ReadOnly())
+		t.Cleanup(func() {
+			if c != nil {
+				c.Close()
+			}
+		})
+		if err == nil {
+			t.Fatalf("Expected error got: %v", err)
+		}
+	})
+}
+
 func TestTTL(t *testing.T) {
 	t.Parallel() // Parallel because we sleep
 	c, err := New(tempFile(t))

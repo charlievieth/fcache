@@ -81,6 +81,14 @@ func DisallowUnknownFields() Option {
 	})
 }
 
+// ReadOnly makes the Cache's database read-only. If the database does not
+// already exist, an error is returned.
+func ReadOnly() Option {
+	return optionFunc(func(c *Cache) {
+		c.readOnly = true
+	})
+}
+
 // A Cache is a fast SQLite based on-disk cache.
 type Cache struct {
 	once        sync.Once
@@ -89,6 +97,7 @@ type Cache struct {
 	busyTimeout time.Duration
 	filename    string
 	strictJSON  bool // Disallow unknown fields when unmarshalling JSON
+	readOnly    bool
 }
 
 // New returns a new Cache with filename as the SQLite3 database path.
@@ -108,11 +117,28 @@ func New(filename string, opts ...Option) (*Cache, error) {
 		"_busy_timeout": []string{strconv.FormatInt(cache.busyTimeout.Milliseconds(), 10)},
 		"_journal_mode": []string{"WAL"},
 	}
+	if cache.readOnly {
+		dsn.Add("mode", "ro")
+	}
 	db, err := sql.Open("sqlite3", "file:"+filename+"?"+dsn.Encode())
 	if err != nil {
 		return nil, fmt.Errorf("fcache: %w", err)
 	}
 	cache.db = db
+
+	// If opened in read-only mode and the file does not exist - better to
+	// catch that error here then in a method call.
+	//
+	// NB: We wait until we've created the DB to perform this check so that
+	// we can get its error.
+	if cache.readOnly && filename != ":memory:" {
+		if fi, err := os.Stat(cache.Database()); err != nil || !fi.Mode().IsRegular() {
+			if err := cache.db.Ping(); err != nil {
+				cache.db.Close()
+				return nil, err
+			}
+		}
+	}
 	return cache, nil
 }
 
@@ -133,7 +159,7 @@ func userCacheDir() (string, error) {
 // On Linux this might be "$HOME/.cache/{NAME}/cache.sqlite3".
 //
 // On macOS this might be "$HOME/Library/Caches/{NAME}/cache.sqlite3".
-func NewUserCache(name string) (*Cache, error) {
+func NewUserCache(name string, opts ...Option) (*Cache, error) {
 	cache, err := userCacheDir()
 	if err != nil {
 		return nil, fmt.Errorf("fcache: failed to locate user cache directory: %w", err)
@@ -142,7 +168,7 @@ func NewUserCache(name string) (*Cache, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("fcache: failed to create cache directory: %w", err)
 	}
-	return New(dir + string(os.PathSeparator) + "cache.sqlite3")
+	return New(dir+string(os.PathSeparator)+"cache.sqlite3", opts...)
 }
 
 // Database returns the file path of the Cache's database.
