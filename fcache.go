@@ -213,7 +213,7 @@ Loop:
 			// busy timeouts is almost zero. In that case an extremely short
 			// wait period makes sense. BUT if this library is used / to be
 			// used by a longer living program (assuming parallelism) this
-			// wait/backoff strategy will be extremely detrimental.any
+			// wait/backoff strategy will be extremely detrimental.
 			//
 			// Given the above, we should probably make this tune-able in order
 			// to support more use cases.
@@ -385,15 +385,14 @@ func (c *Cache) KeysContext(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	var keys []string
-	var serr error // scan error
 	for rows.Next() {
 		var key string
-		if serr = rows.Scan(&key); err != nil {
+		if err = rows.Scan(&key); err != nil {
 			break
 		}
 		keys = append(keys, key)
 	}
-	if serr != nil {
+	if err != nil {
 		rows.Close()
 		return keys, err
 	}
@@ -519,14 +518,13 @@ func (c *Cache) EntriesContext(ctx context.Context) ([]Entry, error) {
 		return nil, err
 	}
 	var ents []Entry
-	var serr error // scan error
 	for rows.Next() {
 		var (
 			e         Entry
 			createdAt int64
 			expiresAt int64
 		)
-		if serr = rows.Scan(&createdAt, &expiresAt, &e.Key, &e.Data); err != nil {
+		if err = rows.Scan(&createdAt, &expiresAt, &e.Key, &e.Data); err != nil {
 			break
 		}
 		e.CreatedAt = time.UnixMilli(createdAt)
@@ -535,7 +533,7 @@ func (c *Cache) EntriesContext(ctx context.Context) ([]Entry, error) {
 		}
 		ents = append(ents, e)
 	}
-	if serr != nil {
+	if err != nil {
 		rows.Close()
 		return ents, err
 	}
