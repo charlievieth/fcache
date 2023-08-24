@@ -81,8 +81,8 @@ func DisallowUnknownFields() Option {
 	})
 }
 
-// ReadOnly makes the Cache's database read-only. If the database does not
-// already exist, an error is returned.
+// ReadOnly makes the Cache read-only. If the database does not already exist,
+// an error is returned.
 func ReadOnly() Option {
 	return optionFunc(func(c *Cache) {
 		c.readOnly = true
