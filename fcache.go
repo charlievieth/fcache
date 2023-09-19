@@ -100,12 +100,15 @@ type Cache struct {
 	readOnly    bool
 }
 
-// New returns a new Cache with filename as the SQLite3 database path.
-// If filename does not exist, it will be created.
+// TODO: consider renaming New => Open
+
+// Open returns a new Cache with filename as the SQLite3 database path.
+// If filename does not exist, it will be created (parent directories
+// are not created).
 //
 // It is allowed, but not always recommended to use ":memory:" as the filename,
 // which will create an in-memory cache.
-func New(filename string, opts ...Option) (*Cache, error) {
+func Open(filename string, opts ...Option) (*Cache, error) {
 	cache := &Cache{
 		busyTimeout: defaultBusyTimeout,
 		filename:    filename,
@@ -149,7 +152,7 @@ func userCacheDir() (string, error) {
 	return os.UserCacheDir()
 }
 
-// NewUserCache returns a new cache using the default cache directory for the
+// OpenUserCache returns a new cache using the default cache directory for the
 // current OS. The $XDG_CACHE_HOME environment variable is respected on all
 // systems (not just Linux).
 //
@@ -159,7 +162,7 @@ func userCacheDir() (string, error) {
 // On Linux this might be "$HOME/.cache/{NAME}/cache.sqlite3".
 //
 // On macOS this might be "$HOME/Library/Caches/{NAME}/cache.sqlite3".
-func NewUserCache(name string, opts ...Option) (*Cache, error) {
+func OpenUserCache(name string, opts ...Option) (*Cache, error) {
 	cache, err := userCacheDir()
 	if err != nil {
 		return nil, fmt.Errorf("fcache: failed to locate user cache directory: %w", err)
@@ -168,7 +171,7 @@ func NewUserCache(name string, opts ...Option) (*Cache, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("fcache: failed to create cache directory: %w", err)
 	}
-	return New(dir+string(os.PathSeparator)+"cache.sqlite3", opts...)
+	return Open(dir+string(os.PathSeparator)+"cache.sqlite3", opts...)
 }
 
 // Database returns the file path of the Cache's database.
@@ -180,7 +183,12 @@ func (c *Cache) Close() error { return c.db.Close() }
 // isBusyErr returns true is the error is a sqlite3 bust timeout error.
 func isBusyErr(err error) bool {
 	for err != nil {
-		if e, ok := err.(sqlite3.Error); ok {
+		switch e := err.(type) {
+		case sqlite3.Error:
+			// The sqlite3 returns the error as a value.
+			return e.Code == sqlite3.ErrBusy
+		case *sqlite3.Error:
+			// Handle the error being wrapped as a pointer.
 			return e.Code == sqlite3.ErrBusy
 		}
 		err = errors.Unwrap(err)
