@@ -43,11 +43,11 @@ func TestUserCacheDir(t *testing.T) {
 	})
 }
 
-func TestNewUserCache(t *testing.T) {
+func TestOpenUserCache(t *testing.T) {
 	tmp := t.TempDir()
 	// dir := filepath.Join(tmp)
 	t.Setenv("XDG_CACHE_HOME", tmp)
-	c, err := NewUserCache("test")
+	c, err := OpenUserCache("test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestSpaceInDatabaseName(t *testing.T) {
 	t.Cleanup(func() {
 		os.RemoveAll(tmp)
 	})
-	c, err := New(filepath.Join(tmp, "my database name.sqlite3"))
+	c, err := Open(filepath.Join(tmp, "my database name.sqlite3"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func tempFile(t testing.TB) string {
 }
 
 func TestCache(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func waitMilli(t testing.TB) {
 }
 
 func TestCount(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestCount(t *testing.T) {
 }
 
 func TestEmptyKey(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestEmptyKey(t *testing.T) {
 }
 
 func TestKeyNotFound(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestKeyNotFound(t *testing.T) {
 }
 
 func TestExpiredCount(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestExpiredCount(t *testing.T) {
 }
 
 func TestContains(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestContains(t *testing.T) {
 }
 
 func TestKeys(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ func TestKeys(t *testing.T) {
 }
 
 func TestDelete(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestDelete(t *testing.T) {
 }
 
 func TestDisallowUnknownFields(t *testing.T) {
-	c, err := New(tempFile(t), DisallowUnknownFields())
+	c, err := Open(tempFile(t), DisallowUnknownFields())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestDisallowUnknownFields(t *testing.T) {
 
 func TestReadOnly(t *testing.T) {
 	tmp := tempFile(t)
-	c, err := New(tmp)
+	c, err := Open(tmp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestReadOnly(t *testing.T) {
 	}
 
 	openReadOnly := func(t *testing.T) *Cache {
-		c, err := New(tmp, ReadOnly())
+		c, err := Open(tmp, ReadOnly())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -380,7 +380,7 @@ func TestReadOnly(t *testing.T) {
 	})
 
 	t.Run("Open", func(t *testing.T) {
-		c, err := New(tempFile(t), ReadOnly())
+		c, err := Open(tempFile(t), ReadOnly())
 		t.Cleanup(func() {
 			if c != nil {
 				c.Close()
@@ -394,7 +394,7 @@ func TestReadOnly(t *testing.T) {
 
 func TestTTL(t *testing.T) {
 	t.Parallel() // Parallel because we sleep
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +421,7 @@ func TestTTL(t *testing.T) {
 }
 
 func TestInvalidType(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,7 +438,7 @@ func TestInvalidType(t *testing.T) {
 }
 
 func TestNullValues(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +467,7 @@ func TestContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +486,7 @@ func TestContextCancelled(t *testing.T) {
 }
 
 func TestClosed(t *testing.T) {
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +537,7 @@ func TestParallelWrites(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			// TODO(charlie): we may need a much longer busy timeout when testing in CI
-			c, err := New(tmp, BusyTimeout(time.Second))
+			c, err := Open(tmp, BusyTimeout(time.Second))
 			if err != nil {
 				errorf("%v", err)
 				return
@@ -574,7 +574,7 @@ func TestParallelWrites(t *testing.T) {
 
 func TestPrune(t *testing.T) {
 	t.Parallel() // Parallel because we sleep
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -615,7 +615,7 @@ func TestEntries(t *testing.T) {
 		return data
 	}
 
-	c, err := New(tempFile(t))
+	c, err := Open(tempFile(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -734,14 +734,18 @@ func TestEntryUnmarshal(t *testing.T) {
 }
 
 func TestIsBusyError(t *testing.T) {
-	var err error = sqlite3.Error{Code: sqlite3.ErrBusy}
-	if ok := isBusyErr(err); !ok {
-		t.Errorf("isBusyErr(%#v) = %t; want: %t", err, ok, true)
-	}
-	for i := 0; i < 3; i++ {
-		err = fmt.Errorf("wrapped %d: %w", i, err)
+	for _, err := range []error{
+		sqlite3.Error{Code: sqlite3.ErrBusy},
+		&sqlite3.Error{Code: sqlite3.ErrBusy}, // Handle the error being wrapped as a pointer
+	} {
 		if ok := isBusyErr(err); !ok {
 			t.Errorf("isBusyErr(%#v) = %t; want: %t", err, ok, true)
+		}
+		for i := 0; i < 3; i++ {
+			err = fmt.Errorf("wrapped %d: %w", i, err)
+			if ok := isBusyErr(err); !ok {
+				t.Errorf("isBusyErr(%#v) = %t; want: %t", err, ok, true)
+			}
 		}
 	}
 }
@@ -756,7 +760,7 @@ func benchDatabase(t testing.TB) string {
 }
 
 func benchCache(t testing.TB, opts ...Option) *Cache {
-	c, err := New(benchDatabase(t), opts...)
+	c, err := Open(benchDatabase(t), opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -764,12 +768,11 @@ func benchCache(t testing.TB, opts ...Option) *Cache {
 	return c
 }
 
-// TODO: include lazyInit() time?
-func BenchmarkCacheNew(b *testing.B) {
+func BenchmarkCacheOpen(b *testing.B) {
 	tmp := benchDatabase(b)
 	ctx := context.Background()
 	for i := 0; i < b.N; i++ {
-		c, err := New(tmp)
+		c, err := Open(tmp)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -833,24 +836,26 @@ func BenchmarkCacheLoad1000(b *testing.B) {
 // Benchmark both opening a new cache and a get. This is a common
 // workflow for CLI tools that need to cache short-lived results
 // for things like auto-completion.
-func BenchmarkCacheNewLoad(b *testing.B) {
+func BenchmarkCacheOpenLoad(b *testing.B) {
 	if *memory {
 		b.Skip("skipping: benchmark cannot run with the 'memory' option")
 	}
 	tmp := tempFile(b)
-	c, err := New(tmp)
+	c, err := Open(tmp)
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer c.Close()
 
 	if err := c.Store("key", 1, -1); err != nil {
+		c.Close()
 		b.Fatal(err)
 	}
-	c.Close()
+	if err := c.Close(); err != nil {
+		b.Fatal(err)
+	}
 
 	for i := 0; i < b.N; i++ {
-		cc, err := New(tmp)
+		cc, err := Open(tmp)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -871,15 +876,6 @@ func BenchmarkCacheStore(b *testing.B) {
 	if err := c.lazyInit(ctx); err != nil {
 		b.Fatal(err)
 	}
-	const indexStmt = `
-	CREATE INDEX
-		expires_at_unix_ms_idx
-	ON
-		cache(expires_at_unix_ms)
-	WHERE expires_at_unix_ms >= 0;`
-	if _, err := c.db.ExecContext(ctx, indexStmt); err != nil {
-		b.Fatal(err)
-	}
 
 	var keys = [8]string{
 		"key_1",
@@ -891,11 +887,10 @@ func BenchmarkCacheStore(b *testing.B) {
 		"key_7",
 		"key_8",
 	}
-	baseTTL := time.Duration(time.Now().UnixMilli())
 	for i := 0; i < b.N; i++ {
 		var ttl time.Duration
 		if i&1 == 0 {
-			ttl = baseTTL + (time.Duration(i+1) * time.Millisecond * 2)
+			ttl = time.Minute
 		} else {
 			ttl = -1
 		}
