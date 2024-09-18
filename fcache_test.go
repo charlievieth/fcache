@@ -450,7 +450,29 @@ func TestNullValues(t *testing.T) {
 		}
 	})
 
-	t.Run("Load", func(t *testing.T) {
+	t.Run("LoadPointer", func(t *testing.T) {
+		var v *struct{}
+		_, err := c.Load("key2", &v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v != nil {
+			t.Errorf("v == %+v; want: nil", v)
+		}
+	})
+
+	t.Run("LoadValue", func(t *testing.T) {
+		var v struct{}
+		_, err := c.Load("key2", &v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v != struct{}{} {
+			t.Errorf("v == %+v; want: %+v", v, struct{}{})
+		}
+	})
+
+	t.Run("NullDest", func(t *testing.T) {
 		// TODO: return a useful error here
 		_, err := c.Load("key2", nil)
 		if err == nil {

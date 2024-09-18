@@ -15,7 +15,7 @@ all: vet test
 
 .PHONY: test test_libsqlite3
 test test_libsqlite3: vet
-	@$(GO_TEST)
+	@$(GO_TEST) ./...
 
 # Use the installed libsqlite3 instead of the one bundled with go-sqlite3
 test_libsqlite3: override GO_TEST_FLAGS += -tags=libsqlite3
