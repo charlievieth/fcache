@@ -12,12 +12,24 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mattn/go-sqlite3"
 )
+
+// DefaultBusyTimeout is the default busy timeout used when none is specfified.
+//
+// https://www.sqlite.org/pragma.html#pragma_busy_timeout
+const DefaultBusyTimeout = 100 * time.Millisecond
+
+// Schema table exists to future proof changes
+const schemaVersion = 1
 
 // NB: using an index on "expires_at_unix_ms" makes Prune much faster
 // (10x with 2048 rows) but slows down insertion and update by ~30%
@@ -26,7 +38,7 @@ import (
 // for the intended use case).
 //
 // NB: making "expires_at_unix_ms" NULLABLE doesn't help
-const createCacheTableStmt = `
+const createCacheTablesStmt = `
 CREATE TABLE IF NOT EXISTS cache (
 	created_at_unix_ms INTEGER NOT NULL,
 	expires_at_unix_ms INTEGER NOT NULL,
@@ -40,9 +52,14 @@ CREATE INDEX IF NOT EXISTS
 ON
 	cache(expires_at_unix_ms)
 WHERE
-	expires_at_unix_ms >= 0;`
+	expires_at_unix_ms >= 0;
 
-const defaultBusyTimeout = time.Millisecond * 20
+CREATE TABLE IF NOT EXISTS schema (
+	version         INTEGER NOT NULL,
+	UNIQUE(version) ON CONFLICT IGNORE
+);
+
+INSERT INTO schema VALUES(1);`
 
 // An Option configures a Cache.
 type Option interface {
@@ -58,12 +75,13 @@ func (f optionFunc) apply(cache *Cache) {
 
 // WithBusyTimeout sets the busy timeout of the Cache.
 //
-// In addition to SQLite3's busy timeout logic the Cache will also retry queries
-// that fail with SQLITE_BUSY until the busy timeout expires. This is to handle
-// the busy timeout setting of SQlite3 not always working as expected.
+// In addition to SQLite3's busy timeout logic the Cache will also retry
+// queries that fail with SQLITE_BUSY or SQLITE_LOCKED until the busy timeout
+// expires. This is to handle the busy timeout setting of SQlite3 not always
+// working as expected.
 //
 // https://www.sqlite.org/pragma.html#pragma_busy_timeout
-func BusyTimeout(d time.Duration) Option {
+func WithBusyTimeout(d time.Duration) Option {
 	if d < 0 {
 		d = 0
 	}
@@ -81,36 +99,30 @@ func DisallowUnknownFields() Option {
 	})
 }
 
-// ReadOnly makes the Cache read-only. If the database does not already exist,
-// an error is returned.
-func ReadOnly() Option {
-	return optionFunc(func(c *Cache) {
-		c.readOnly = true
-	})
-}
-
 // A Cache is a fast SQLite based on-disk cache.
 type Cache struct {
 	once        sync.Once
-	db          *sql.DB
-	err         error // init error, if any
+	writeDB     *sql.DB // Write conn, only one exists
+	readDB      *sql.DB // Read conn, multiple exist
+	err         error   // init error, if any
 	busyTimeout time.Duration
 	filename    string
-	strictJSON  bool // Disallow unknown fields when unmarshalling JSON
-	readOnly    bool
+	strictJSON  bool // Disallow unknown fields when unmarshaling JSON
 }
-
-// TODO: consider renaming New => Open
 
 // Open returns a new Cache with filename as the SQLite3 database path.
 // If filename does not exist, it will be created (parent directories
-// are not created).
+// are not created). It is allowed, but not always recommended, to use
+// ":memory:" as the filename, which will create an in-memory cache.
 //
-// It is allowed, but not always recommended to use ":memory:" as the filename,
-// which will create an in-memory cache.
+// Only one [Cache] should be opened per-process. If multiple connections to
+// the database are opened (either by the same process or by multiple processes)
+// there is a chance that [sqlite3.ErrLocked] errors will occur. This library
+// will retry ops that return [sqlite3.ErrLocked] up to the configured busy
+// timeout.
 func Open(filename string, opts ...Option) (*Cache, error) {
 	cache := &Cache{
-		busyTimeout: defaultBusyTimeout,
+		busyTimeout: DefaultBusyTimeout,
 		filename:    filename,
 	}
 	for _, o := range opts {
@@ -118,30 +130,26 @@ func Open(filename string, opts ...Option) (*Cache, error) {
 	}
 	dsn := url.Values{
 		"_busy_timeout": []string{strconv.FormatInt(cache.busyTimeout.Milliseconds(), 10)},
+		"_cache_size":   []string{"-20000"},
 		"_journal_mode": []string{"WAL"},
+		"_synchronous":  []string{"NORMAL"},
+		"_txlock:":      []string{"immediate"},
 	}
-	if cache.readOnly {
-		dsn.Add("mode", "ro")
-	}
-	db, err := sql.Open("sqlite3", "file:"+filename+"?"+dsn.Encode())
+	writeDB, err := sql.Open("sqlite3", "file:"+filename+"?"+dsn.Encode())
 	if err != nil {
-		return nil, fmt.Errorf("fcache: %w", err)
+		return nil, fmt.Errorf("fcache: error opening database for writing: %w", err)
 	}
-	cache.db = db
+	writeDB.SetMaxOpenConns(1) // Only 1 writer
+	cache.writeDB = writeDB
 
-	// If opened in read-only mode and the file does not exist - better to
-	// catch that error here then in a method call.
-	//
-	// NB: We wait until we've created the DB to perform this check so that
-	// we can get its error.
-	if cache.readOnly && filename != ":memory:" {
-		if fi, err := os.Stat(cache.Database()); err != nil || !fi.Mode().IsRegular() {
-			if err := cache.db.Ping(); err != nil {
-				cache.db.Close()
-				return nil, err
-			}
-		}
+	dsn.Set("_query_only", "true")
+	readDB, err := sql.Open("sqlite3", "file:"+filename+"?"+dsn.Encode())
+	if err != nil {
+		return nil, fmt.Errorf("fcache: error opening database for reading: %w", err)
 	}
+	readDB.SetMaxOpenConns(max(4, runtime.NumCPU()))
+	cache.readDB = readDB
+
 	return cache, nil
 }
 
@@ -152,44 +160,102 @@ func userCacheDir() (string, error) {
 	return os.UserCacheDir()
 }
 
+func validateCacheName(name string) error {
+	if name == "" {
+		return errors.New("fcache: cache name must not be empty")
+	}
+	if name == "." {
+		return errors.New(`fcache: invalid cache name: "."`)
+	}
+	if !utf8.ValidString(name) {
+		return errors.New(`fcache: cache name contains invalid UTF-8`)
+	}
+	switch trimmed := strings.TrimSpace(name); {
+	case trimmed == "":
+		return errors.New("fcache: cache name must not contain only spaces")
+	case trimmed != name:
+		return errors.New("fcache: cache name may not start or end with whitespace")
+	}
+	// Check for names that could be used to write outside of the
+	// cache directory.
+	if strings.Contains(name, "..") {
+		return errors.New(`fcache: cache name may not contain: ".."`)
+	}
+	if filepath.Clean(name) != name {
+		return errors.New("fcache: filepath.Clean modifies the cache name")
+	}
+	return nil
+}
+
 // OpenUserCache returns a new cache using the default cache directory for the
 // current OS. The $XDG_CACHE_HOME environment variable is respected on all
-// systems (not just Linux).
+// systems (not just Linux) otherwise [os.UserCacheDir] is used.
+//
+// On Linux cache directory might be "$HOME/.cache/fcache/{NAME}/cache.sqlite3"
+// and on macOS it might be "$HOME/Library/Caches/fcache/{NAME}/cache.sqlite3".
 //
 // Name is the name of the directory to create under the user cache directory
 // and the database name is always "cache.sqlite3".
 //
-// On Linux this might be "$HOME/.cache/{NAME}/cache.sqlite3".
-//
-// On macOS this might be "$HOME/Library/Caches/{NAME}/cache.sqlite3".
+// The name may contain multiple slashes, which will create a sub-directories.
+// This is useful for grouping caches by project (e.g. "project/cache_1",
+// "project/cache_2"). The name may not contain ".." or any other sequence
+// that would cause it to be created outside of the user cache directory.
 func OpenUserCache(name string, opts ...Option) (*Cache, error) {
+	if err := validateCacheName(name); err != nil {
+		return nil, err
+	}
 	cache, err := userCacheDir()
 	if err != nil {
 		return nil, fmt.Errorf("fcache: failed to locate user cache directory: %w", err)
 	}
-	dir := cache + string(os.PathSeparator) + name
+	dir := filepath.Join(cache, "fcache", name)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("fcache: failed to create cache directory: %w", err)
 	}
-	return Open(dir+string(os.PathSeparator)+"cache.sqlite3", opts...)
+	return Open(filepath.Join(dir, "cache.sqlite3"), opts...)
 }
 
 // Database returns the file path of the Cache's database.
 func (c *Cache) Database() string { return c.filename }
 
 // Close closes the Cache and the underlying database.
-func (c *Cache) Close() error { return c.db.Close() }
+func (c *Cache) Close() error {
+	closeDB := func(db *sql.DB) error {
+		if db != nil {
+			return db.Close()
+		}
+		return errors.New("not initialized")
+	}
+	we := closeDB(c.writeDB)
+	re := closeDB(c.readDB)
+	switch {
+	case we != nil && re == nil:
+		return fmt.Errorf("fcache: closing write database: %w", we)
+	case we == nil && re != nil:
+		return fmt.Errorf("fcache: closing read database: %w", re)
+	case we != nil && re != nil:
+		return fmt.Errorf("fcache: closing databases: write db: %w read db: %w", we, re)
+	}
+	return nil
+}
 
-// isBusyErr returns true is the error is a sqlite3 bust timeout error.
-func isBusyErr(err error) bool {
-	for err != nil {
+// isRetryableErr returns true if the error is transient and the query should
+// be retried.
+func isRetryableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Limit ourselves to an 50 nested errors - this is extremely
+	// unlikely, but it's best to avoid unbounded loops.
+	for i := 0; err != nil && i < 50; i++ {
 		switch e := err.(type) {
 		case sqlite3.Error:
-			// The sqlite3 returns the error as a value.
-			return e.Code == sqlite3.ErrBusy
+			// The sqlite3 library returns the error as a value.
+			return e.Code == sqlite3.ErrBusy || e.Code == sqlite3.ErrLocked
 		case *sqlite3.Error:
 			// Handle the error being wrapped as a pointer.
-			return e.Code == sqlite3.ErrBusy
+			return e.Code == sqlite3.ErrBusy || e.Code == sqlite3.ErrLocked
 		}
 		err = errors.Unwrap(err)
 	}
@@ -203,6 +269,9 @@ func stopTicker(t *time.Ticker) {
 }
 
 func (c *Cache) retryNoInit(ctx context.Context, fn func() error) (err error) {
+	if c.busyTimeout <= 0 {
+		return fn()
+	}
 	var tick *time.Ticker
 	to := getTimer(c.busyTimeout)
 	defer putTimer(to)
@@ -210,22 +279,14 @@ func (c *Cache) retryNoInit(ctx context.Context, fn func() error) (err error) {
 	done := ctx.Done()
 Loop:
 	for {
-		if err = fn(); err == nil || !isBusyErr(err) {
+		if err = fn(); err == nil || !isRetryableErr(err) {
 			break
 		}
-		// Handle busy timeout
+		// Retry the DB op (often due to the database being locked), but
+		// respect the configured busy timeout.
 		if tick == nil {
-			// TODO: The original use case for this library was for it be a very
-			// fast cache for CLIs (for example: caching the names of remote
-			// servers for bash completion) where the chance of conflicts and
-			// busy timeouts is almost zero. In that case an extremely short
-			// wait period makes sense. BUT if this library is used / to be
-			// used by a longer living program (assuming parallelism) this
-			// wait/backoff strategy will be extremely detrimental.
-			//
-			// Given the above, we should probably make this tune-able in order
-			// to support more use cases.
-			tick = time.NewTicker(time.Millisecond)
+			// Lazily initialize the ticker.
+			tick = time.NewTicker(5 * time.Millisecond)
 		}
 		select {
 		case <-tick.C:
@@ -240,18 +301,37 @@ Loop:
 	return err
 }
 
-// retry handles BUSY errors
-func (c *Cache) retry(ctx context.Context, fn func() error) (err error) {
+func (c *Cache) retryWrite(ctx context.Context, fn func(tx *sql.Tx) error) (err error) {
 	if err := c.lazyInit(ctx); err != nil {
 		return err
 	}
-	return c.retryNoInit(ctx, fn)
+	return c.retryNoInit(ctx, func() error {
+		tx, err := c.writeDB.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if err := fn(tx); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
+func (c *Cache) retryRead(ctx context.Context, fn func(db *sql.DB) error) (err error) {
+	if err := c.lazyInit(ctx); err != nil {
+		return err
+	}
+	return c.retryNoInit(ctx, func() error {
+		return fn(c.readDB)
+	})
+}
+
+// NB: this is always read-only
 func (c *Cache) retryRows(ctx context.Context, query string) (*sql.Rows, error) {
 	var rows *sql.Rows
-	err := c.retry(ctx, func() (err error) {
-		rows, err = c.db.QueryContext(ctx, query)
+	err := c.retryRead(ctx, func(db *sql.DB) (err error) {
+		rows, err = db.QueryContext(ctx, query)
 		return err
 	})
 	if err != nil {
@@ -265,12 +345,41 @@ func (c *Cache) retryRows(ctx context.Context, query string) (*sql.Rows, error) 
 }
 
 func (c *Cache) lazyInit(ctx context.Context) error {
+	const tablesExistQuery = `
+	SELECT
+		COUNT(*)
+	FROM
+		sqlite_master
+	WHERE
+		type = 'table' AND (name = 'cache' OR name = 'schema');`
 	c.once.Do(func() {
+		// Fast check for the tables existing. Ignore the error since it
+		// is likely due to the tables not existing.
+		var count int64
 		err := c.retryNoInit(ctx, func() error {
+			return c.writeDB.QueryRowContext(ctx, tablesExistQuery).Scan(&count)
+		})
+		if err != nil {
+			// This should only happen if the context is cancelled.
+			c.err = fmt.Errorf("fcache: error checking if cache tables exist: %w", err)
+			return
+		}
+		if count == 2 {
+			return
+		}
+		err = c.retryNoInit(ctx, func() error {
 			// NB(charlie): this is fast enough and any attempt to make it
 			// faster has not yielded a significant improvement - so stop.
-			_, err := c.db.ExecContext(ctx, createCacheTableStmt)
-			return err
+			tx, err := c.writeDB.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			_, err = tx.ExecContext(ctx, createCacheTablesStmt)
+			if err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			return tx.Commit()
 		})
 		// Wrap the error outside of the retry handler to make detection of
 		// busy errors simpler/faster.
@@ -282,17 +391,27 @@ func (c *Cache) lazyInit(ctx context.Context) error {
 	return c.err
 }
 
+// RawMessage is an alias of [json.RawMessage] and can be used to pass an
+// already JSON encoded raw value to the cache without it having to be
+// marshaled again.
+//
+// RawMessage is a raw encoded JSON value.
+// It implements [Marshaler] and [Unmarshaler] and can
+// be used to delay JSON decoding or precompute a JSON encoding.
+type RawMessage json.RawMessage
+
 // StoreContext encodes val to JSON and sets it as the value for key, replacing
 // any existing value. If the value cannot be JSON encoded the returned error
 // will unwrap to: json.UnsupportedTypeError.
 //
 // The TTL controls when an entry expires and has millisecond resolution.
 // A negative TTL never expires.
+//
+// [RawMessage] can be used to pass a raw encoded JSON value and skip marshaling.
 func (c *Cache) StoreContext(ctx context.Context, key string, val any, ttl time.Duration) error {
 	data, err := json.Marshal(val)
 	if err != nil {
-		return fmt.Errorf("fcache: cannot JSON encode (%T) for key (%s): %w",
-			val, key, err)
+		return fmt.Errorf("fcache: cannot JSON encode (%T): %w", val, err)
 	}
 	createdAt := time.Now().UnixMilli()
 	expiresAt := int64(-1)
@@ -306,11 +425,14 @@ func (c *Cache) StoreContext(ctx context.Context, key string, val any, ttl time.
 		key,
 		data
 	) VALUES (?, ?, ?, ?);`
-	// TODO: use a descriptive error message
-	return c.retry(ctx, func() error {
-		_, err := c.db.ExecContext(ctx, query, createdAt, expiresAt, key, data)
+	err = c.retryWrite(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, query, createdAt, expiresAt, key, data)
 		return err
 	})
+	if err != nil {
+		return fmt.Errorf("fcache: failed to store value: %w", err)
+	}
+	return nil
 }
 
 // Store encodes val to JSON and sets it as the value for key, replacing any
@@ -319,6 +441,8 @@ func (c *Cache) StoreContext(ctx context.Context, key string, val any, ttl time.
 //
 // The TTL controls when an entry expires and has millisecond resolution.
 // A negative TTL never expires.
+//
+// [RawMessage] can be used to pass a raw encoded JSON value and skip marshaling.
 func (c *Cache) Store(key string, v any, ttl time.Duration) error {
 	return c.StoreContext(context.Background(), key, v, ttl)
 }
@@ -336,11 +460,9 @@ func (c *Cache) unmarshal(data []byte, dst any) error {
 	return json.Unmarshal(data, dst)
 }
 
-// TODO: consider returning sql.ErrNoRows if an entry is not found. That way
-// users can distinguish between an expired entry and a missing entry
-//
-// LoadContext unmarshals the JSON encoded value stored in the cache for key into
-// dst and returns true if an entry for key existed and is not expired.
+// LoadContext stores the value for key in dst, which must not be nil, and
+// returns true if an entry for key exists and is not expired. If the entry
+// is expired it will still be stored in dst and false will be returned.
 //
 // An error is returned if there was an error querying the cache database or
 // if there was an error unmarshaling the JSON value into dst.
@@ -358,23 +480,24 @@ func (c *Cache) LoadContext(ctx context.Context, key string, dst any) (bool, err
 		key = ? LIMIT 1;`
 	var data []byte
 	var expiredAt int64
-	err := c.retry(ctx, func() error {
-		return c.db.QueryRowContext(ctx, query, key).Scan(&expiredAt, &data)
+	err := c.retryRead(ctx, func(db *sql.DB) error {
+		return db.QueryRowContext(ctx, query, key).Scan(&expiredAt, &data)
 	})
 	if err != nil {
 		if isNoRowsErr(err) {
 			return false, nil
 		}
-		return false, err
+		return false, fmt.Errorf("fcache: error loading value: %w", err)
 	}
 	if err := c.unmarshal(data, dst); err != nil {
-		return false, err
+		return false, fmt.Errorf("fcache: cannot store value in (%T): %w", dst, err)
 	}
 	return expiredAt == -1 || time.Now().UnixMilli() < expiredAt, nil
 }
 
-// Load unmarshals the JSON encoded value stored in the cache for key into
-// dst and returns true if an entry for key existed and is not expired.
+// Load stores the value for key in dst, which must not be nil, and
+// returns true if an entry for key exists and is not expired. If the entry
+// is expired it will still be stored in dst and false will be returned.
 //
 // An error is returned if there was an error querying the cache database or
 // if there was an error unmarshaling the JSON value into dst.
@@ -415,13 +538,100 @@ func (c *Cache) Keys() ([]string, error) {
 	return c.KeysContext(context.Background())
 }
 
+type fcacheError struct {
+	msg string
+	err error
+}
+
+func wrapError(cause string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &fcacheError{msg: cause, err: err}
+}
+
+func (f *fcacheError) Error() string {
+	if strings.HasPrefix(f.msg, "fcache: ") {
+		return f.msg + ": " + f.err.Error()
+	}
+	return "fcache: " + f.msg + ": " + f.err.Error()
+}
+
+func (c *Cache) wrapError(cause string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if err == c.err {
+		return c.err
+	}
+	return wrapError(cause, err)
+}
+
 // DeleteContext deletes the entry with key from the cache and returns true if
 // an entry with key was deleted. If no entry with key exists false is returned.
 func (c *Cache) DeleteContext(ctx context.Context, key string) (bool, error) {
 	const query = `DELETE FROM cache WHERE key = ?;`
 	var found bool
-	err := c.retry(ctx, func() error {
-		res, err := c.db.ExecContext(ctx, query, key)
+	err := c.retryWrite(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, query, key)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		found = n > 0
+		return nil
+	})
+	if err != nil {
+		err = fmt.Errorf("fcache: delete: %w", err)
+	}
+	return found, err
+}
+
+// Delete deletes the entry with key from the cache and returns true if an entry
+// with key was deleted. If no entry with key exists false is returned.
+func (c *Cache) Delete(key string) (bool, error) {
+	return c.DeleteContext(context.Background(), key)
+}
+
+func bindParams(n int) string {
+	switch n {
+	case 0:
+		return ""
+	case 1:
+		return "?"
+	case 2:
+		return "?, ?"
+	case 3:
+		return "?, ?, ?"
+	case 4:
+		return "?, ?, ?, ?"
+	case 5:
+		return "?, ?, ?, ?, ?"
+	case 6:
+		return "?, ?, ?, ?, ?, ?"
+	default:
+		return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
+	}
+}
+
+// DeleteManyContext deletes the entries with keys from the cache and returns
+// true if at least one entry was deleted. If no entries were deleted false is
+// returned.
+func (c *Cache) DeleteManyContext(ctx context.Context, keys ...string) (bool, error) {
+	if len(keys) == 0 {
+		return false, nil
+	}
+	query := `DELETE FROM cache WHERE key IN (` + bindParams(len(keys)) + ");"
+	args := make([]any, len(keys))
+	for i, k := range keys {
+		args[i] = k
+	}
+	var found bool
+	err := c.retryWrite(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}
@@ -435,18 +645,18 @@ func (c *Cache) DeleteContext(ctx context.Context, key string) (bool, error) {
 	return found, err
 }
 
-// Delete deletes the entry with key from the cache and returns true if an entry
-// with key was deleted. If no entry with key exists false is returned.
-func (c *Cache) Delete(key string) (bool, error) {
-	return c.DeleteContext(context.Background(), key)
+// DeleteMany deletes the entries with keys from the cache and returns true if
+// at least one entry was deleted. If no entries were deleted false is returned.
+func (c *Cache) DeleteMany(keys ...string) (bool, error) {
+	return c.DeleteManyContext(context.Background(), keys...)
 }
 
 // CountContext returns the number of entries in the cache.
 func (c *Cache) CountContext(ctx context.Context) (int64, error) {
 	const query = `SELECT COUNT(*) FROM cache;`
 	var n int64
-	err := c.retry(ctx, func() error {
-		return c.db.QueryRowContext(ctx, query).Scan(&n)
+	err := c.retryRead(ctx, func(db *sql.DB) error {
+		return db.QueryRowContext(ctx, query).Scan(&n)
 	})
 	return n, err
 }
@@ -465,8 +675,8 @@ func (c *Cache) ExpiredCountContext(ctx context.Context) (int64, error) {
 		0 <= expires_at_unix_ms AND expires_at_unix_ms < ?;`
 	var n int64
 	ts := time.Now().UnixMilli()
-	err := c.retry(ctx, func() error {
-		return c.db.QueryRowContext(ctx, query, ts).Scan(&n)
+	err := c.retryRead(ctx, func(db *sql.DB) error {
+		return db.QueryRowContext(ctx, query, ts).Scan(&n)
 	})
 	return n, err
 }
@@ -481,8 +691,8 @@ func (c *Cache) ExpiredCount() (int64, error) {
 func (c *Cache) ContainsContext(ctx context.Context, key string) (bool, error) {
 	const query = `SELECT EXISTS(SELECT 1 FROM cache WHERE key = ?);`
 	var exists bool
-	err := c.retry(ctx, func() error {
-		return c.db.QueryRowContext(ctx, query, key).Scan(&exists)
+	err := c.retryRead(ctx, func(db *sql.DB) error {
+		return db.QueryRowContext(ctx, query, key).Scan(&exists)
 	})
 	return exists, err
 }
@@ -501,8 +711,8 @@ func (c *Cache) EntryContext(ctx context.Context, key string) (*Entry, error) {
 		createdAt int64
 		expiresAt int64
 	)
-	err := c.retry(ctx, func() error {
-		return c.db.QueryRowContext(ctx, query, key).Scan(&createdAt, &expiresAt, &e.Key, &e.Data)
+	err := c.retryRead(ctx, func(db *sql.DB) error {
+		return db.QueryRowContext(ctx, query, key).Scan(&createdAt, &expiresAt, &e.Key, &e.Data)
 	})
 	if err != nil {
 		return nil, err
@@ -519,14 +729,15 @@ func (c *Cache) Entry(key string) (*Entry, error) {
 	return c.EntryContext(context.Background(), key)
 }
 
-// EntriesContext returns a slice of all the entries in the cache.
+// EntriesContext returns a slice of all the entries in the cache sorted by key.
+// [sql.ErrNoRows] is returned if there are no entries.
 func (c *Cache) EntriesContext(ctx context.Context) ([]Entry, error) {
 	rows, err := c.retryRows(ctx, `SELECT * FROM cache ORDER BY key;`)
 	if err != nil {
 		return nil, err
 	}
 	var ents []Entry
-	for rows.Next() {
+	for i := 0; rows.Next(); i++ {
 		var (
 			e         Entry
 			createdAt int64
@@ -542,16 +753,14 @@ func (c *Cache) EntriesContext(ctx context.Context) ([]Entry, error) {
 		ents = append(ents, e)
 	}
 	if err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return ents, err
 	}
-	if err := rows.Err(); err != nil {
-		return ents, err
-	}
-	return ents, nil
+	return ents, rows.Err()
 }
 
 // Entries returns a slice of all the entries in the cache sorted by key.
+// [sql.ErrNoRows] is returned if there are no entries.
 func (c *Cache) Entries() ([]Entry, error) {
 	return c.EntriesContext(context.Background())
 }
@@ -559,24 +768,34 @@ func (c *Cache) Entries() ([]Entry, error) {
 // PruneContext prunes any expired entries from the cache and performs a VACUUM
 // if any entries were removed.
 func (c *Cache) PruneContext(ctx context.Context) error {
-	// TODO: check if the database exists
 	const query = `
 	DELETE FROM
 		cache
 	WHERE
 		0 <= expires_at_unix_ms AND expires_at_unix_ms < ?;`
-	return c.retry(ctx, func() error {
-		res, err := c.db.ExecContext(ctx, query, time.Now().UnixMilli())
+	var rowsDeleted int64
+	err := c.retryWrite(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, query, time.Now().UnixMilli())
 		if err != nil {
 			return err
 		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			if _, err := c.db.ExecContext(ctx, "VACUUM"); err != nil {
-				return err
-			}
-		}
+		rowsDeleted, _ = res.RowsAffected()
 		return nil
 	})
+	if err != nil {
+		return fmt.Errorf("fcache: prune: %w", err)
+	}
+	if rowsDeleted > 0 {
+		// Can't run VACUUM in a transaction
+		err := c.retryNoInit(ctx, func() error {
+			_, err := c.writeDB.ExecContext(ctx, "VACUUM;")
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("fcache: vacuum: %w", err)
+		}
+	}
+	return nil
 }
 
 // Prune prunes any expired entries from the cache and performs a VACUUM
