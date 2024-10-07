@@ -2,4 +2,4 @@ module github.com/charlievieth/fcache
 
 go 1.21
 
-require github.com/mattn/go-sqlite3 v1.14.23
+require github.com/mattn/go-sqlite3 v1.14.24
