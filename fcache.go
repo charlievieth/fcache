@@ -347,24 +347,23 @@ func (c *Cache) retryRows(ctx context.Context, query string) (*sql.Rows, error) 
 func (c *Cache) lazyInit(ctx context.Context) error {
 	const tablesExistQuery = `
 	SELECT
-		COUNT(*)
+		COUNT(*) = 2
 	FROM
 		sqlite_master
 	WHERE
-		type = 'table' AND (name = 'cache' OR name = 'schema');`
+		type = 'table' AND name IN ('cache', 'schema');`
 	c.once.Do(func() {
-		// Fast check for the tables existing. Ignore the error since it
-		// is likely due to the tables not existing.
-		var count int64
+		// Fast check for the tables existing.
+		var initialized bool
 		err := c.retryNoInit(ctx, func() error {
-			return c.writeDB.QueryRowContext(ctx, tablesExistQuery).Scan(&count)
+			return c.readDB.QueryRowContext(ctx, tablesExistQuery).Scan(&initialized)
 		})
 		if err != nil {
 			// This should only happen if the context is cancelled.
-			c.err = fmt.Errorf("fcache: error checking if cache tables exist: %w", err)
+			c.err = fmt.Errorf("fcache: error checking if fcache tables exist: %w", err)
 			return
 		}
-		if count == 2 {
+		if initialized {
 			return
 		}
 		err = c.retryNoInit(ctx, func() error {
